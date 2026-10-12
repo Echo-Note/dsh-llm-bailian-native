@@ -1,71 +1,81 @@
 name: CI
 
+# 触发时机：
+#   - 推送到 main
+#   - 面向 main 的 PR
+#   - 手动触发
+#
+# 纯文档改动不触发校验（见 paths-ignore）。注意 `package.json` **不在**忽略列表里 ——
+# 版本号递增正是发版的触发条件，不能漏。
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
   pull_request:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
   workflow_dispatch:
 
+# 同一分支只保留最新一次运行，避免连续推送时排队堆积
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# 默认最小权限；需要写 Release 的作业再单独提权
 permissions:
   contents: read
 
+env:
+  NODE_VERSION: '22'
+
 jobs:
-  test:
-    name: offline suites (node ${{ matrix.node }})
+  # ── 校验 ────────────────────────────────────────────────────────────────────
+  verify:
+    name: 校验（语法 / 清单 / 凭据）
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        node: ['20', '22']
-
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - name: 检出代码
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      - name: 安装 Node
+        uses: actions/setup-node@v4
         with:
-          node-version: ${{ matrix.node }}
+          node-version: ${{ env.NODE_VERSION }}
 
-      # No `npm install`: every suite is deliberately dependency-free so CI cannot
-      # be the only place that proves the plugin loads. The one compile-time
-      # dependency (schemastery, used for the Config schema) is vendored under
-      # vendor/ and its licence ships beside it.
-      - name: Run the offline suites
+      # 刻意不 `npm install`：每个套件都**不依赖任何包**，这样 CI 不会成为唯一能证明
+      # 插件可加载的地方。唯一的编译期依赖（schemastery，用于 Config schema）内置在
+      # vendor/ 并随包携带其许可证。
+      - name: 运行离线套件
         run: node tests/run.mjs
 
-      - name: Check every source file parses
+      - name: 每个源文件都能解析
         run: |
-          set -e
-          for file in $(git ls-files 'lib/*.js' 'tests/*.mjs'); do
+          set -euo pipefail
+          for file in $(git ls-files 'lib/*.js' 'tests/*.mjs' 'scripts/*.mjs'); do
             node --check "$file"
           done
           echo "all files parse"
 
-      - name: Assert no credentials are committed
+      - name: 确认没有凭据被提交
         run: |
-          set -e
-          # Shapes this plugin handles: Bailian model keys, Aliyun AccessKeys.
-          if git grep -nE 'sk-[A-Za-z0-9]{16,}|LTAI[A-Za-z0-9]{12,}' -- . ':!*README*' ':!*.test.mjs'; then
-            echo "::error::a credential-shaped string is committed"
+          set -euo pipefail
+          # 本插件处理的凭据形状：百炼模型 Key、阿里云 AccessKey
+          if git grep -nE 'sk-[A-Za-z0-9]{16,}|LTAI[A-Za-z0-9]{12,}' -- . ':!CHANGELOG.md' ':!*.test.mjs'; then
+            echo "::error::提交里出现了凭据形状的字符串"
             exit 1
           fi
           echo "no credential-shaped strings"
 
-  typert-manifest:
-    name: typert manifest shape
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-
-      # The host loader's validateTypertManifest requires model/services/events/
-      # objects, tags arrays on every documented node, and a strict result codec.
-      # Registration failures only surface at boot, so assert the shape here — this
-      # is the check that would have caught the three defects that took a live
-      # server to diagnose.
-      - name: Assert the TYPERT manifest satisfies the loader's validator
+      - name: 断言 TYPERT 清单满足 loader 校验
         run: |
+          # 宿主 loader 的 validateTypertManifest 要求 model{services,events,objects}、
+          # 每个文档节点的 tags 数组、以及 strict result codec。注册失败只在启动时暴露，
+          # 所以在这里断言形状 —— 这三条正是此前必须靠真机与日志才能诊断的缺陷。
           node --input-type=module -e "
           import { TYPERT } from './lib/typert.host.js'
           const fail = (message) => { console.error('::error::' + message); process.exit(1) }
@@ -84,12 +94,9 @@ jobs:
             if (typeof service.exportName !== 'string' || !service.exportName) fail('service.exportName must be a non-empty string')
             if (!Array.isArray(service.members) || !Array.isArray(service.types)) fail('service.members/types must be arrays')
             for (const member of service.members) {
-              if (typeof member.name !== 'string' || !member.name) fail('member.name must be a non-empty string')
-              if (typeof member.signature !== 'string' || !member.signature) fail('member.signature must be a non-empty string')
-              if (typeof member.kind !== 'string' || !member.kind) fail('member.kind must be a non-empty string')
+              if (!member.name || !member.signature || !member.kind) fail('every member needs name/signature/kind')
             }
           }
-          const schemas = new Set(TYPERT.schemas.map((s) => s.name))
           for (const schema of TYPERT.schemas) {
             if (typeof schema.create !== 'function') fail('schema \"' + schema.name + '\" has no create() factory')
           }
@@ -98,33 +105,20 @@ jobs:
             for (const key of ['id', 'service', 'namespace', 'method']) {
               if (typeof invocation[key] !== 'string' || !invocation[key]) fail('invocation.' + key + ' must be a non-empty string')
             }
-            const receiver = invocation.invocation
-            if (receiver === undefined || receiver.kind !== 'direct') fail('invocation ' + invocation.id + ' receiver must be direct')
+            if (invocation.invocation?.kind !== 'direct') fail('invocation ' + invocation.id + ' receiver must be direct')
             if (!Array.isArray(invocation.parameters)) fail('invocation ' + invocation.id + ' parameters must be an array')
-            const result = invocation.result
-            if (!isObject(result) || result.mode !== 'strict') fail('invocation ' + invocation.id + ' result codec must be strict')
-            if (typeof result.typeSymbol !== 'string' || !result.typeSymbol) fail('invocation ' + invocation.id + ' strict codec needs a typeSymbol')
-            if (typeof result.create !== 'function') fail('invocation ' + invocation.id + ' strict codec needs create()')
+            if (!isObject(invocation.result) || invocation.result.mode !== 'strict') fail('invocation ' + invocation.id + ' result codec must be strict')
+            if (typeof invocation.result.typeSymbol !== 'string' || !invocation.result.typeSymbol) fail('strict codec needs a typeSymbol')
+            if (typeof invocation.result.create !== 'function') fail('strict codec needs create()')
           }
-          console.log('typert manifest satisfies the loader validator:', TYPERT.invocations.length, 'invocation(s)')
+          console.log('typert manifest OK:', TYPERT.invocations.length, 'invocation(s)')
           "
 
-  client-descriptor:
-    name: client descriptor shape
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-
-      # The client half is a browser bundle, so it cannot be imported here. Assert
-      # the descriptor contract dsh-api-gateway/lib/client.js enforces instead:
-      # parameters must be iterable and invocation.kind must be present, otherwise
-      # $mount throws before any request is made. (The request envelope itself is
-      # built by dsh-client-connection, so it is not asserted here.)
-      - name: Assert the client descriptor is a complete InvocationDescriptor
+      - name: 断言客户端描述符是完整 InvocationDescriptor
         run: |
+          # 客户端半边是浏览器 bundle，无法在此导入，因此断言 dsh-api-gateway 的
+          # 客户端会读的字段：parameters 必须可迭代、invocation.kind 必须存在，
+          # 否则 $mount 在任何请求之前就抛错。
           node --input-type=module -e "
           import { readFileSync } from 'node:fs'
           const source = readFileSync('lib/client.js', 'utf8')
@@ -139,23 +133,14 @@ jobs:
           for (const marker of required) {
             if (!source.includes(marker)) fail('lib/client.js is missing ' + JSON.stringify(marker))
           }
-          if (!/id: '@local\\/dsh-llm-bailian-native#bailianNative\\/snapshot'/.test(source)) fail('the descriptor id must name the package, service and method')
+          if (!/id: '@local\\/dsh-llm-bailian-native#bailianNative\\/snapshot'/.test(source)) fail('descriptor id must name package, service and method')
           console.log('client descriptor shape OK:', required.length, 'markers present')
           "
 
-  host-binding:
-    name: host typertRemote binding
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-
-      # Without the hand-written binding the gateway answers
-      # 'Service \"bailianNative\" has no visible typertRemote binding' at call time.
-      - name: Assert the provided service carries its binding
+      - name: 断言宿主 typertRemote 绑定
         run: |
+          # 没有这个手写绑定，网关会在调用时报
+          # 'Service \"bailianNative\" has no visible typertRemote binding'。
           node --input-type=module -e "
           import { createStatsService } from './lib/stats.js'
           import { defaultProfile, resolveRoute } from './lib/config.js'
@@ -165,15 +150,192 @@ jobs:
           const binding = service.typertRemote
           if (binding === undefined) fail('the service has no typertRemote binding')
           if (binding.service !== service) fail('typertRemote.service must be the provided object')
-          if (binding.serviceKey !== 'bailianNative') fail('typertRemote.serviceKey must match the manifest service key')
-          if (binding.namespace !== 'bailianNative') fail('typertRemote.namespace must match the manifest namespace')
+          if (binding.serviceKey !== 'bailianNative') fail('typertRemote.serviceKey must match the manifest')
+          if (binding.namespace !== 'bailianNative') fail('typertRemote.namespace must match the manifest')
           const descriptor = Object.getOwnPropertyDescriptor(service, 'typertRemote')
           if (descriptor.enumerable !== false || descriptor.writable !== false) fail('the binding must be non-enumerable and immutable')
           if (typeof service.snapshot !== 'function') fail('the service must expose snapshot()')
           const snapshot = await service.snapshot()
-          if (snapshot === null || typeof snapshot !== 'object') fail('snapshot() must return an object')
           for (const key of ['route', 'billing', 'cache', 'prices', 'catalog']) {
             if (!(key in snapshot)) fail('snapshot is missing ' + key)
           }
           console.log('host binding OK; snapshot keys:', Object.keys(snapshot).join(','))
           "
+
+      - name: 断言版本号与 CHANGELOG 一致
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "require('./package.json').version")"
+          if ! grep -qE "^## \\[${VERSION//./\\.}\\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md 缺少 ${VERSION} 的区块；Release 说明取自 CHANGELOG，不能为空"
+            exit 1
+          fi
+          node scripts/release-notes.mjs --version "$VERSION" > /dev/null
+          echo "package.json ${VERSION} 与 CHANGELOG 一致"
+
+  # ── 打包 ────────────────────────────────────────────────────────────────────
+  package:
+    name: 打包产物
+    needs: [verify]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # 本插件没有编译步骤：DSH 的 Loader 直接消费 lib/ 下的源码，客户端半边也是
+      # 手写的纯 JS bundle。因此"构建"= 产出可安装/可分发的 tarball，并用打包器的
+      # dry-run 验证 files 白名单真的覆盖了运行时需要的每个文件。
+      - name: 校验 files 白名单覆盖运行时文件
+        run: |
+          set -euo pipefail
+          npm pack --dry-run --json > /tmp/pack.json
+          node --input-type=module -e "
+          import { readFileSync } from 'node:fs'
+          const report = JSON.parse(readFileSync('/tmp/pack.json', 'utf8'))
+          const files = new Set(report[0].files.map((entry) => entry.path))
+          const fail = (message) => { console.error('::error::' + message); process.exit(1) }
+          const required = [
+            'package.json',
+            'README.md',
+            'CHANGELOG.md',
+            'cordis.patch.yml',
+            'lib/index.js',
+            'lib/client.js',
+            'lib/typert.host.js',
+            'lib/stats.js',
+            'lib/billing.js',
+            'lib/overview.js',
+            'lib/catalog.js',
+            'lib/config.js',
+            'lib/credentials.js',
+            'lib/protocol.js',
+            'lib/stream.js',
+            'lib/providers/index.js',
+            'lib/providers/dashscope/native.js',
+            'vendor/schemastery/package.json',
+            'vendor/schemastery/lib/index.mjs',
+            'vendor/cosmokit/lib/index.js',
+          ]
+          const missing = required.filter((path) => !files.has(path))
+          if (missing.length > 0) fail('tarball 缺少运行时文件: ' + missing.join(', '))
+          console.log('tarball 覆盖全部运行时文件（' + files.size + ' 个）')
+          "
+
+      - name: 生成 tarball 与校验和
+        run: |
+          set -euo pipefail
+          TARBALL="$(npm pack --silent | tail -1)"
+          # 附件名刻意不带版本号：releases/latest/download/<name>.tgz 是稳定地址，
+          # 而 releases/download/v<版本>/<name>.tgz 又能精确锁版本 —— 版本由 tag 承载。
+          cp "$TARBALL" dsh-llm-bailian-native.tgz
+          sha256sum dsh-llm-bailian-native.tgz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-llm-bailian-native-tgz
+          path: |
+            dsh-llm-bailian-native.tgz
+            SHA256SUMS
+          if-no-files-found: error
+
+  # ── 版本解析 ────────────────────────────────────────────────────────────────
+  resolve:
+    name: 解析版本与 tag 状态
+    needs: [verify, package]
+    if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+      tagExists: ${{ steps.check.outputs.tagExists }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 读取版本号
+        id: read
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "require('./package.json').version")"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "包版本：$VERSION"
+
+      - name: 该版本的 tag 是否已存在
+        id: check
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.read.outputs.version }}"
+          if git rev-parse -q --verify "refs/tags/v${VERSION}" > /dev/null; then
+            echo "tagExists=true" >> "$GITHUB_OUTPUT"
+            echo "v${VERSION} 已发布，跳过发布步骤"
+          else
+            echo "tagExists=false" >> "$GITHUB_OUTPUT"
+            echo "v${VERSION} 尚未发布"
+          fi
+
+  # ── 发布 ────────────────────────────────────────────────────────────────────
+  release:
+    name: 打 tag 并创建 Release
+    needs: [resolve]
+    # 用「v<版本> 是否已存在」判断该版本是否已发，因此重跑是幂等的。
+    # 这里创建 tag 会触发 push(tag) 事件，但本 workflow 只监听 push(branches: main)，
+    # 不会自我触发，无需 [skip ci]。
+    if: ${{ needs.resolve.outputs.tagExists == 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: 下载已构建的产物
+        uses: actions/download-artifact@v4
+        with:
+          name: dsh-llm-bailian-native-tgz
+
+      - name: 校验产物完整性
+        # 用 package 作业生成的校验和确认跨作业传递后产物未损坏，
+        # 同时保证发布出去的 hash 与附件确实对得上。
+        run: |
+          set -euo pipefail
+          test -f SHA256SUMS || { echo "::error::缺少 SHA256SUMS"; exit 1; }
+          sha256sum -c SHA256SUMS
+
+      - name: 生成 Release 说明（取自 CHANGELOG）
+        # 正文直接取 CHANGELOG 里该版本的区块，而不是 --generate-notes 的自动摘要：
+        # 后者按 commit 罗列，与写给人看的那份说明是两回事。
+        run: |
+          set -euo pipefail
+          node scripts/release-notes.mjs --version "${{ needs.resolve.outputs.version }}" --out release-notes.md
+          head -5 release-notes.md
+
+      - name: 创建 tag 与 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.resolve.outputs.version }}"
+          TAG="v${VERSION}"
+          gh release create "$TAG" \
+            dsh-llm-bailian-native.tgz \
+            SHA256SUMS \
+            --title "$TAG" \
+            --notes-file release-notes.md \
+            --target "$GITHUB_SHA"
+          echo "::notice title=已发布::$TAG"
