@@ -1,0 +1,43 @@
+{
+  "name": "@local/dsh-llm-bailian-native",
+  "version": "0.6.0",
+  "private": true,
+  "description": "阿里云百炼 / DashScope 原生协议（非 OpenAI 兼容模式）模型提供方适配器，含模型目录、价格表与本地令牌计费。",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./catalog": {
+      "default": "./lib/catalog.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "meta": {
+    "title": "阿里云百炼（DashScope 原生协议）",
+    "description": "以原生 /api/v1 协议接入阿里云百炼：模型目录刷新、价格表、本地令牌计费，并预留腾讯云/百度云适配接口。"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true
+    }
+  },
+  "scripts": {
+    "test": "node tests/run.mjs"
+  },
+  "files": [
+    "lib",
+    "vendor",
+    "cordis.patch.yml",
+    "README.md",
+    "tests"
+  ]
+}

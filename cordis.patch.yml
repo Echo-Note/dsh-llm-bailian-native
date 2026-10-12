@@ -1,0 +1,10 @@
+# Bundle patch for @local/dsh-llm-bailian-native.
+#
+# One Host row. `plugin_manager install_bundle` performs package installation and
+# bundle selection; this file only declares the row.
+#
+# The row id is also the settings namespace the adapter advertises to the Web
+# Models page (see lib/index.js: settingsNs = ctx.fiber.entry?.options.id).
+- insert:
+    - id: llm-bailian-native
+      name: '@local/dsh-llm-bailian-native'
