@@ -201,12 +201,14 @@ await test('the plugin registers no agent tool of its own', () => {
   assert.deepEqual(state.registeredTools, [])
 })
 
-await test('provides the stats service its typert manifest declares', () => {
+await test('provides the stats service its typert manifest declares', async () => {
   const state = mount({ 'bailian-native': defaultProfile() })
   const service = state.provided.bailianNative
   assert.ok(service, 'the gateway resolves service "bailianNative" from the plugin context')
-  for (const method of ['overview', 'billing', 'prices']) {
-    assert.equal(typeof service[method], 'function', `the manifest declares ${method}()`)
+  assert.equal(typeof service.snapshot, 'function', 'the manifest declares snapshot()')
+  const snapshot = await service.snapshot()
+  for (const key of ['route', 'configured', 'billing', 'cache', 'prices', 'catalog']) {
+    assert.ok(key in snapshot, `snapshot is missing ${key}`)
   }
 })
 
