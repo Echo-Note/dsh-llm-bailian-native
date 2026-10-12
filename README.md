@@ -1,5 +1,7 @@
 # @local/dsh-llm-bailian-native
 
+![CI](https://github.com/Echo-Note/dsh-llm-bailian-native/actions/workflows/ci.yml/badge.svg)
+
 阿里云百炼 / DashScope **原生协议**模型提供方适配器（DeepSeek Harness bundle）。
 
 推理链路只走 DashScope 原生 HTTP 接口，**不使用** `/compatible-mode/v1`。已有的 `bailian`

@@ -1,0 +1,172 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: offline suites (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['20', '22']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      # No `npm install`: every suite is deliberately dependency-free so CI cannot
+      # be the only place that proves the plugin loads. The one compile-time
+      # dependency (schemastery, used for the Config schema) is vendored under
+      # vendor/ and its licence ships beside it.
+      - name: Run the offline suites
+        run: node tests/run.mjs
+
+      - name: Check every source file parses
+        run: |
+          set -e
+          for file in $(git ls-files 'lib/*.js' 'tests/*.mjs'); do
+            node --check "$file"
+          done
+          echo "all files parse"
+
+      - name: Assert no credentials are committed
+        run: |
+          set -e
+          # Shapes this plugin handles: Bailian model keys, Aliyun AccessKeys.
+          if git grep -nE 'sk-[A-Za-z0-9]{16,}|LTAI[A-Za-z0-9]{12,}' -- . ':!*README*' ':!*.test.mjs'; then
+            echo "::error::a credential-shaped string is committed"
+            exit 1
+          fi
+          echo "no credential-shaped strings"
+
+  typert-manifest:
+    name: typert manifest shape
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # The host loader's validateTypertManifest requires model/services/events/
+      # objects, tags arrays on every documented node, and a strict result codec.
+      # Registration failures only surface at boot, so assert the shape here — this
+      # is the check that would have caught the three defects that took a live
+      # server to diagnose.
+      - name: Assert the TYPERT manifest satisfies the loader's validator
+        run: |
+          node --input-type=module -e "
+          import { TYPERT } from './lib/typert.host.js'
+          const fail = (message) => { console.error('::error::' + message); process.exit(1) }
+          const isObject = (v) => typeof v === 'object' && v !== null && !Array.isArray(v)
+
+          if (typeof TYPERT.package !== 'string' || !TYPERT.package) fail('TYPERT.package must be a non-empty string')
+          if (TYPERT.face !== 'host') fail('TYPERT.face must be \"host\"')
+          if (!Array.isArray(TYPERT.schemas)) fail('TYPERT.schemas must be an array')
+          if (!isObject(TYPERT.model)) fail('TYPERT.model must be an object')
+          for (const key of ['services', 'events', 'objects']) {
+            if (!Array.isArray(TYPERT.model[key])) fail('TYPERT.model.' + key + ' must be an array')
+          }
+          for (const service of TYPERT.model.services) {
+            if (!Array.isArray(service.tags)) fail('service.tags must be an array')
+            if (typeof service.key !== 'string' || !service.key) fail('service.key must be a non-empty string')
+            if (typeof service.exportName !== 'string' || !service.exportName) fail('service.exportName must be a non-empty string')
+            if (!Array.isArray(service.members) || !Array.isArray(service.types)) fail('service.members/types must be arrays')
+            for (const member of service.members) {
+              if (typeof member.name !== 'string' || !member.name) fail('member.name must be a non-empty string')
+              if (typeof member.signature !== 'string' || !member.signature) fail('member.signature must be a non-empty string')
+              if (typeof member.kind !== 'string' || !member.kind) fail('member.kind must be a non-empty string')
+            }
+          }
+          const schemas = new Set(TYPERT.schemas.map((s) => s.name))
+          for (const schema of TYPERT.schemas) {
+            if (typeof schema.create !== 'function') fail('schema \"' + schema.name + '\" has no create() factory')
+          }
+          if (!Array.isArray(TYPERT.invocations) || TYPERT.invocations.length === 0) fail('TYPERT.invocations must be a non-empty array')
+          for (const invocation of TYPERT.invocations) {
+            for (const key of ['id', 'service', 'namespace', 'method']) {
+              if (typeof invocation[key] !== 'string' || !invocation[key]) fail('invocation.' + key + ' must be a non-empty string')
+            }
+            const receiver = invocation.invocation
+            if (receiver === undefined || receiver.kind !== 'direct') fail('invocation ' + invocation.id + ' receiver must be direct')
+            if (!Array.isArray(invocation.parameters)) fail('invocation ' + invocation.id + ' parameters must be an array')
+            const result = invocation.result
+            if (!isObject(result) || result.mode !== 'strict') fail('invocation ' + invocation.id + ' result codec must be strict')
+            if (typeof result.typeSymbol !== 'string' || !result.typeSymbol) fail('invocation ' + invocation.id + ' strict codec needs a typeSymbol')
+            if (typeof result.create !== 'function') fail('invocation ' + invocation.id + ' strict codec needs create()')
+          }
+          console.log('typert manifest satisfies the loader validator:', TYPERT.invocations.length, 'invocation(s)')
+          "
+
+  client-descriptor:
+    name: client descriptor shape
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # The client half is a browser bundle, so it cannot be imported here. Assert
+      # the descriptor contract dsh-api-gateway/lib/client.js enforces instead:
+      # parameters must be iterable and invocation.kind must be present, otherwise
+      # $mount throws before any request is made.
+      - name: Assert the client descriptor is a complete InvocationDescriptor
+        run: |
+          node --input-type=module -e "
+          import { readFileSync } from 'node:fs'
+          const source = readFileSync('lib/client.js', 'utf8')
+          const fail = (message) => { console.error('::error::' + message); process.exit(1) }
+          for (const required of ['type: \\'client-request\\'', 'remote.\$mount', 'parameters: []', \"invocation: { kind: 'direct' }\"]) {
+            if (!source.includes(required)) fail('lib/client.js is missing ' + required)
+          }
+          if (!/descriptors: \[\{/.test(source)) fail('lib/client.js declares no descriptors array')
+          if (!/namespace: 'bailianNative'/.test(source)) fail('the descriptor must name the namespace the gateway addresses')
+          console.log('client descriptor shape OK')
+          "
+
+  host-binding:
+    name: host typertRemote binding
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # Without the hand-written binding the gateway answers
+      # 'Service \"bailianNative\" has no visible typertRemote binding' at call time.
+      - name: Assert the provided service carries its binding
+        run: |
+          node --input-type=module -e "
+          import { createStatsService } from './lib/stats.js'
+          import { defaultProfile, resolveRoute } from './lib/config.js'
+          const fail = (message) => { console.error('::error::' + message); process.exit(1) }
+          const route = resolveRoute('bailian-native', defaultProfile())
+          const service = createStatsService({ get: () => undefined }, () => new Map([['bailian-native', route]]))
+          const binding = service.typertRemote
+          if (binding === undefined) fail('the service has no typertRemote binding')
+          if (binding.service !== service) fail('typertRemote.service must be the provided object')
+          if (binding.serviceKey !== 'bailianNative') fail('typertRemote.serviceKey must match the manifest service key')
+          if (binding.namespace !== 'bailianNative') fail('typertRemote.namespace must match the manifest namespace')
+          const descriptor = Object.getOwnPropertyDescriptor(service, 'typertRemote')
+          if (descriptor.enumerable !== false || descriptor.writable !== false) fail('the binding must be non-enumerable and immutable')
+          if (typeof service.snapshot !== 'function') fail('the service must expose snapshot()')
+          const snapshot = await service.snapshot()
+          if (snapshot === null || typeof snapshot !== 'object') fail('snapshot() must return an object')
+          for (const key of ['route', 'billing', 'cache', 'prices', 'catalog']) {
+            if (!(key in snapshot)) fail('snapshot is missing ' + key)
+          }
+          console.log('host binding OK; snapshot keys:', Object.keys(snapshot).join(','))
+          "
