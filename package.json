@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-llm-bailian-native",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "private": true,
   "description": "阿里云百炼 / DashScope 原生协议（非 OpenAI 兼容模式）模型提供方适配器，含模型目录、价格表与本地令牌计费。",
   "type": "module",
