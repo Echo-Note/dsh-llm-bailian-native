@@ -50,6 +50,7 @@ function mount(providersConfig) {
     discoveryNs: null,
     discovery: null,
     settingsConfigured: null,
+    provided: {},
     registeredTools: [],
     loggerErrors: [],
   }
@@ -77,6 +78,7 @@ function mount(providersConfig) {
     },
     get: (name) => (name === 'settings' ? ctx.settings : name === 'credentials' ? undefined : undefined),
     on: () => () => {},
+    provide: (name, value) => { state.provided[name] = value; return () => {} },
     logger: {
       warn: () => {},
       error: (...args) => state.loggerErrors.push(args),
@@ -197,6 +199,15 @@ await test('the plugin registers no agent tool of its own', () => {
   // Models page, which addresses the same settings section.
   const state = mount({ 'bailian-native': defaultProfile() })
   assert.deepEqual(state.registeredTools, [])
+})
+
+await test('provides the stats service its typert manifest declares', () => {
+  const state = mount({ 'bailian-native': defaultProfile() })
+  const service = state.provided.bailianNative
+  assert.ok(service, 'the gateway resolves service "bailianNative" from the plugin context')
+  for (const method of ['overview', 'billing', 'prices']) {
+    assert.equal(typeof service[method], 'function', `the manifest declares ${method}()`)
+  }
 })
 
 await test('the plugin opts out of a hand-written automatic settings page', () => {
