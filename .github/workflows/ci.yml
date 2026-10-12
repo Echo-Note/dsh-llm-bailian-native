@@ -121,19 +121,26 @@ jobs:
       # The client half is a browser bundle, so it cannot be imported here. Assert
       # the descriptor contract dsh-api-gateway/lib/client.js enforces instead:
       # parameters must be iterable and invocation.kind must be present, otherwise
-      # $mount throws before any request is made.
+      # $mount throws before any request is made. (The request envelope itself is
+      # built by dsh-client-connection, so it is not asserted here.)
       - name: Assert the client descriptor is a complete InvocationDescriptor
         run: |
           node --input-type=module -e "
           import { readFileSync } from 'node:fs'
           const source = readFileSync('lib/client.js', 'utf8')
           const fail = (message) => { console.error('::error::' + message); process.exit(1) }
-          for (const required of ['type: \\'client-request\\'', 'remote.\$mount', 'parameters: []', \"invocation: { kind: 'direct' }\"]) {
-            if (!source.includes(required)) fail('lib/client.js is missing ' + required)
+          const required = [
+            'descriptors: [{',
+            \"namespace: 'bailianNative'\",
+            \"invocation: { kind: 'direct' }\",
+            'parameters: []',
+            'remote.\$mount',
+          ]
+          for (const marker of required) {
+            if (!source.includes(marker)) fail('lib/client.js is missing ' + JSON.stringify(marker))
           }
-          if (!/descriptors: \[\{/.test(source)) fail('lib/client.js declares no descriptors array')
-          if (!/namespace: 'bailianNative'/.test(source)) fail('the descriptor must name the namespace the gateway addresses')
-          console.log('client descriptor shape OK')
+          if (!/id: '@local\\/dsh-llm-bailian-native#bailianNative\\/snapshot'/.test(source)) fail('the descriptor id must name the package, service and method')
+          console.log('client descriptor shape OK:', required.length, 'markers present')
           "
 
   host-binding:
